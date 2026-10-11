@@ -7,9 +7,42 @@ import {
   pruneMessages,
   stepCountIs,
   streamText,
-  tool
+  tool,
+  wrapLanguageModel,
+  type LanguageModelMiddleware
 } from "ai";
 import { z } from "zod";
+
+// Workers AI + Llama 3.3 (workers-ai-provider 3.3.1) currently emits every
+// text delta twice. This middleware drops the second copy of each pair, so
+// genuine repeats (e.g. "ha", "ha") still come through.
+const dedupeDeltas: LanguageModelMiddleware = {
+  specificationVersion: "v3",
+  wrapStream: async ({ doStream }) => {
+    const { stream, ...rest } = await doStream();
+    let last: string | null = null;
+    let skippedLast = false;
+    const fixed = stream.pipeThrough(
+      new TransformStream({
+        transform(part, controller) {
+          if (part.type === "text-delta") {
+            if (part.delta === last && !skippedLast) {
+              skippedLast = true; // duplicate, drop it
+              return;
+            }
+            last = part.delta;
+            skippedLast = false;
+          } else {
+            last = null;
+            skippedLast = false;
+          }
+          controller.enqueue(part);
+        }
+      })
+    );
+    return { stream: fixed, ...rest };
+  }
+};
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -51,8 +84,11 @@ export class ChatAgent extends AIChatAgent<Env> {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
-        sessionAffinity: this.sessionAffinity
+      model: wrapLanguageModel({
+        model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+          sessionAffinity: this.sessionAffinity
+        }),
+        middleware: dedupeDeltas
       }),
       system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
 
@@ -180,7 +216,13 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
         })
       },
       stopWhen: stepCountIs(20),
-      abortSignal: options?.abortSignal
+      abortSignal: options?.abortSignal,
+      // TEMP debug: confirm each text piece arrives once. Remove before committing.
+      onChunk: ({ chunk }) => {
+        if (chunk.type === "text-delta") {
+          console.log("DELTA:", JSON.stringify(chunk.text));
+        }
+      }
     });
 
     return result.toUIMessageStreamResponse();

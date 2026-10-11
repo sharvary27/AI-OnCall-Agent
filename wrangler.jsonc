@@ -27,16 +27,14 @@
 			{
 				"class_name": "ChatAgent",
 				"name": "ChatAgent"
-			}
+			},
+			{ "name": "Probe", "class_name": "Probe" },
+			
 		]
 	},
 	"migrations": [
-		{
-			"new_sqlite_classes": [
-				"ChatAgent"
-			],
-			"tag": "v1"
-		}
+		{ "tag": "v1", "new_sqlite_classes": ["ChatAgent"] },
+		{ "tag": "v2", "new_sqlite_classes": ["Probe"] }
 	],
 	"observability": {
 		"enabled": true

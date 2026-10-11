@@ -28,31 +28,91 @@ Tools:
 - removeEndpoint: stop monitoring a URL.
 
 Be direct and concise. Only state facts you got from a tool result; if you don't have
-data yet, say so instead of guessing.`;
+data yet, say so instead of guessing.
+Call each tool at most once per request. After a tool returns, answer the user
+using its result; do not call the same tool again with the same input.`;
 
 // Workers AI + Llama 3.3 (workers-ai-provider 3.3.1) currently emits every
-// text delta twice. This middleware drops the second copy of each pair, so
-// genuine repeats (e.g. "ha", "ha") still come through.
+// streamed piece twice: reply text AND tool-call arguments. Doubled tool
+// arguments become invalid JSON like {"url": "{"url": "httpshttps://://...
+// so the tool never runs. This middleware:
+//   1. drops the second copy of each duplicated text / reasoning / tool-input
+//      delta (real repeats like "ha", "ha" still come through), and
+//   2. repairs the final tool-call input if it still isn't valid JSON.
+
+function parsesAsJson(s: string): boolean {
+  try {
+    JSON.parse(s);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Rebuild a string in which every chunk was emitted twice
+// ("httpshttps://://" -> "https://"). Chunk boundaries are unknown, so try
+// chunk sizes with backtracking and accept the first result that is valid JSON.
+function undoubleJson(s: string): string | null {
+  let budget = 20_000; // safety cap on search steps
+  const walk = (i: number, acc: string): string | null => {
+    if (--budget < 0) return null;
+    if (i === s.length) return parsesAsJson(acc) ? acc : null;
+    for (let k = 1; i + 2 * k <= s.length; k++) {
+      const chunk = s.slice(i, i + k);
+      if (chunk === s.slice(i + k, i + 2 * k)) {
+        const found = walk(i + 2 * k, acc + chunk);
+        if (found !== null) return found;
+      }
+    }
+    return null;
+  };
+  return walk(0, "");
+}
+
 const dedupeDeltas: LanguageModelMiddleware = {
   specificationVersion: "v3",
   wrapStream: async ({ doStream }) => {
     const { stream, ...rest } = await doStream();
-    let last: string | null = null;
+    let lastKey: string | null = null; // which stream + piece we saw last
     let skippedLast = false;
+    const toolInputs = new Map<string, string>(); // deduped args per tool call
+
     const fixed = stream.pipeThrough(
       new TransformStream({
         transform(part, controller) {
-          if (part.type === "text-delta") {
-            if (part.delta === last && !skippedLast) {
+          if (
+            part.type === "text-delta" ||
+            part.type === "reasoning-delta" ||
+            part.type === "tool-input-delta"
+          ) {
+            const key = `${part.type}:${part.id}:${part.delta}`;
+            if (key === lastKey && !skippedLast) {
               skippedLast = true; // duplicate, drop it
               return;
             }
-            last = part.delta;
+            lastKey = key;
             skippedLast = false;
-          } else {
-            last = null;
-            skippedLast = false;
+            if (part.type === "tool-input-delta") {
+              toolInputs.set(part.id, (toolInputs.get(part.id) ?? "") + part.delta);
+            }
+            controller.enqueue(part);
+            return;
           }
+
+          lastKey = null;
+          skippedLast = false;
+
+          if (part.type === "tool-call" && !parsesAsJson(part.input)) {
+            const fromDeltas = toolInputs.get(part.toolCallId);
+            const repaired =
+              fromDeltas && parsesAsJson(fromDeltas) ? fromDeltas : undoubleJson(part.input);
+            if (repaired) {
+              controller.enqueue({ ...part, input: repaired });
+              return;
+            }
+            console.warn("[dedupe] could not repair tool input:", part.input);
+          }
+
           controller.enqueue(part);
         }
       })
@@ -75,6 +135,21 @@ function normalizeUrl(input: string): string {
 }
 
 type EndpointRow = { url: string; interval_sec: number; added_at: number };
+
+// Keep tool schemas simple: Workers AI rejects complex JSON schemas
+// (unions / anyOf / null types) with an opaque "internal error".
+// z.coerce accepts both 120 and "120"; toInt() then clamps it to a sane range.
+const looseNumber = z.coerce.number().optional();
+
+function toInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === "number" ? value : parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -149,21 +224,22 @@ export class ChatAgent extends AIChatAgent<Env> {
             "Start monitoring an HTTP(S) endpoint. Runs a check right away, then repeats every intervalSeconds.",
           inputSchema: z.object({
             url: z.string().describe("The URL to monitor, e.g. https://example.com/health"),
-            intervalSeconds: z.coerce
-              .number()
-              .int()
-              .min(60)
-              .max(3600)
-              .optional()
-              .describe("How often to check, 60 to 3600 seconds. Defaults to 300.")
+            intervalSeconds: looseNumber.describe(
+              "How often to check, in seconds (60 to 3600). Defaults to 300."
+            )
           }),
           execute: async ({ url, intervalSeconds }) => {
-            const normalized = normalizeUrl(url);
-            const interval = intervalSeconds ?? 300;
-            const firstCheck = await this.probeFor(normalized).configure(normalized, interval);
-            this.sql`INSERT OR REPLACE INTO endpoints (url, interval_sec, added_at)
-                     VALUES (${normalized}, ${interval}, ${Date.now()})`;
-            return { monitoring: normalized, intervalSeconds: interval, firstCheck };
+            try {
+              const normalized = normalizeUrl(url);
+              const interval = toInt(intervalSeconds, 300, 60, 3600);
+              const firstCheck = await this.probeFor(normalized).configure(normalized, interval);
+              this.sql`INSERT OR REPLACE INTO endpoints (url, interval_sec, added_at)
+                       VALUES (${normalized}, ${interval}, ${Date.now()})`;
+              return { monitoring: normalized, intervalSeconds: interval, firstCheck };
+            } catch (err) {
+              console.error("addEndpoint failed:", err);
+              return { error: errorMessage(err) };
+            }
           }
         }),
 
@@ -171,18 +247,23 @@ export class ChatAgent extends AIChatAgent<Env> {
           description: "List every monitored endpoint with its most recent check.",
           inputSchema: z.object({}),
           execute: async () => {
-            const rows = this.sql<EndpointRow>`SELECT * FROM endpoints ORDER BY added_at`;
-            if (rows.length === 0) return "No endpoints are being monitored yet.";
-            return Promise.all(
-              rows.map(async (r) => {
-                const summary = await this.probeFor(r.url).getSummary(1);
-                return {
-                  url: r.url,
-                  intervalSeconds: r.interval_sec,
-                  latest: summary.checks[0] ?? null
-                };
-              })
-            );
+            try {
+              const rows = this.sql<EndpointRow>`SELECT * FROM endpoints ORDER BY added_at`;
+              if (rows.length === 0) return "No endpoints are being monitored yet.";
+              return await Promise.all(
+                rows.map(async (r) => {
+                  const summary = await this.probeFor(r.url).getSummary(1);
+                  return {
+                    url: r.url,
+                    intervalSeconds: r.interval_sec,
+                    latest: summary.checks[0] ?? null
+                  };
+                })
+              );
+            } catch (err) {
+              console.error("listEndpoints failed:", err);
+              return { error: errorMessage(err) };
+            }
           }
         }),
 
@@ -191,20 +272,19 @@ export class ChatAgent extends AIChatAgent<Env> {
             "Get recent checks, uptime percentage and average latency for one monitored endpoint.",
           inputSchema: z.object({
             url: z.string().describe("The monitored URL"),
-            limit: z.coerce
-              .number()
-              .int()
-              .min(1)
-              .max(100)
-              .optional()
-              .describe("How many recent checks to include. Defaults to 20.")
+            limit: looseNumber.describe("How many recent checks to include (1 to 100). Defaults to 20.")
           }),
           execute: async ({ url, limit }) => {
-            const normalized = normalizeUrl(url);
-            if (!this.isMonitored(normalized)) {
-              return `${normalized} is not being monitored. Use addEndpoint first.`;
+            try {
+              const normalized = normalizeUrl(url);
+              if (!this.isMonitored(normalized)) {
+                return `${normalized} is not being monitored. Use addEndpoint first.`;
+              }
+              return await this.probeFor(normalized).getSummary(toInt(limit, 20, 1, 100));
+            } catch (err) {
+              console.error("getEndpointStatus failed:", err);
+              return { error: errorMessage(err) };
             }
-            return this.probeFor(normalized).getSummary(limit ?? 20);
           }
         }),
 
@@ -214,18 +294,36 @@ export class ChatAgent extends AIChatAgent<Env> {
             url: z.string().describe("The monitored URL")
           }),
           execute: async ({ url }) => {
-            const normalized = normalizeUrl(url);
-            if (!this.isMonitored(normalized)) {
-              return `${normalized} was not being monitored.`;
+            try {
+              const normalized = normalizeUrl(url);
+              if (!this.isMonitored(normalized)) {
+                return `${normalized} was not being monitored.`;
+              }
+              await this.probeFor(normalized).stop();
+              this.sql`DELETE FROM endpoints WHERE url = ${normalized}`;
+              return `Stopped monitoring ${normalized}.`;
+            } catch (err) {
+              console.error("removeEndpoint failed:", err);
+              return { error: errorMessage(err) };
             }
-            await this.probeFor(normalized).stop();
-            this.sql`DELETE FROM endpoints WHERE url = ${normalized}`;
-            return `Stopped monitoring ${normalized}.`;
           }
         })
       },
-      stopWhen: stepCountIs(10),
-      abortSignal: options?.abortSignal
+      // Llama 3.3 on Workers AI tends to call the same tool over and over
+      // instead of answering. Once a step has run tools, give the next step
+      // no tools, so the model has to reply in text using the results.
+      prepareStep: ({ steps }) => {
+        const last = steps.at(-1);
+        if (last && last.toolCalls.length > 0) {
+          return { activeTools: [] };
+        }
+        return {};
+      },
+      stopWhen: stepCountIs(5),
+      abortSignal: options?.abortSignal,
+      onError: ({ error }) => {
+        console.error("[agent] streamText error:", error);
+      }
     });
 
     return result.toUIMessageStreamResponse();

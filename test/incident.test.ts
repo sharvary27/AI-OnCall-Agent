@@ -2,12 +2,16 @@ import { describe, expect, it } from "vitest";
 import {
   buildEvidence,
   fallbackDiagnosis,
+  formatDecisionMessage,
   formatIncidentMessage,
+  formatRecoveredMessage,
+  proposeAction,
   shouldInvestigate,
+  tidyDiagnosis,
   type EndpointContext,
   type Incident,
   type InvestigationParams
-} from "../src/Incident";
+} from "../src/incident";
 import type { FullCheck } from "../src/checks";
 
 const OPENED = Date.parse("2026-10-12T00:37:15Z");
@@ -37,6 +41,7 @@ const recheck: FullCheck = {
 };
 
 const context: EndpointContext = {
+  intervalSec: 60,
   baseline: { samples: 0, medianLatencyMs: null, p90LatencyMs: null, errorRatePct: 100 },
   uptimePct: 0,
   openAnomalies: [{ ...params.anomaly, since: OPENED }],
@@ -99,7 +104,9 @@ describe("chat message", () => {
     createdAt: OPENED + 60_000,
     stillOpen: false,
     recheck: { status: 200, latencyMs: 120, ok: true, error: null },
-    diagnosis: "  Latency spiked briefly.\n- recheck 120ms  "
+    diagnosis: "  Latency spiked briefly.\n- recheck 120ms  ",
+    proposal: null,
+    status: "no_action"
   };
 
   it("leads with an icon, the readable type and the URL", () => {
@@ -119,5 +126,90 @@ describe("chat message", () => {
     const text = fallbackDiagnosis(buildEvidence(params, recheck, context, OPENED));
     expect(text).toContain("HTTP 503 in 210ms");
     expect(text).toContain("DNS: NOERROR");
+  });
+});
+
+describe("proposeAction", () => {
+  it("suggests slowing checks while an endpoint is down", () => {
+    const p = proposeAction("down", 60, true, null);
+    expect(p).toEqual({
+      action: "backoff",
+      intervalSec: 300,
+      summary:
+        "Reduce noise: check every 5 minutes instead of every 1 minute while it's failing. Normal checks resume automatically when it recovers."
+    });
+  });
+
+  it("caps the back-off at 30 minutes for outages", () => {
+    expect(proposeAction("down", 600, true, null)?.intervalSec).toBe(1800);
+  });
+
+  it("backs off at least until the rate limit resets", () => {
+    expect(proposeAction("rate_limited", 60, true, { retryAfterSec: 900, resetSec: null })?.intervalSec).toBe(900);
+    expect(proposeAction("quota_low", 60, true, { retryAfterSec: null, resetSec: 30 })?.intervalSec).toBe(300);
+  });
+
+  it("proposes nothing if it already recovered, or for latency spikes", () => {
+    expect(proposeAction("down", 60, false, null)).toBeNull();
+    expect(proposeAction("latency_spike", 60, true, null)).toBeNull();
+  });
+
+  it("proposes nothing if checks are already slow enough", () => {
+    expect(proposeAction("down", 1800, true, null)).toBeNull();
+  });
+});
+
+describe("tidyDiagnosis", () => {
+  it("turns * bullets into - and separates text that follows a list", () => {
+    const raw = "Service unavailable.\n* Status: 503\n* DNS: NOERROR\nLikely cause: the app.";
+    expect(tidyDiagnosis(raw)).toBe("Service unavailable.\n- Status: 503\n- DNS: NOERROR\n\nLikely cause: the app.");
+  });
+
+  it("leaves already-clean text alone", () => {
+    const clean = "Down.\n\n- a\n- b\n\nNext step: x";
+    expect(tidyDiagnosis(clean)).toBe(clean);
+  });
+});
+
+describe("approval messages", () => {
+  const base: Incident = {
+    id: "wf-2",
+    url: "https://httpbin.org/status/503",
+    type: "down",
+    severity: "critical",
+    alertMessage: "2 failed checks in a row (latest: HTTP 503)",
+    openedAt: OPENED,
+    createdAt: OPENED,
+    stillOpen: true,
+    recheck: { status: 503, latencyMs: 200, ok: false, error: null },
+    diagnosis: "Server error.",
+    proposal: { action: "backoff", intervalSec: 300, summary: "Check every 5 minutes." },
+    status: "awaiting_approval"
+  };
+
+  it("asks for approval while waiting", () => {
+    const text = formatIncidentMessage(base);
+    expect(text).toContain("**Suggested action:** Check every 5 minutes.");
+    expect(text).toContain("Reply **approve** or **dismiss** (expires in 30 minutes).");
+  });
+
+  it("stops asking once answered", () => {
+    expect(formatIncidentMessage({ ...base, status: "approved" })).not.toContain("Reply **approve**");
+  });
+
+  it("confirms each outcome", () => {
+    expect(formatDecisionMessage({ ...base, status: "approved" })).toContain("now checking https://httpbin.org/status/503 every 5 minutes");
+    expect(formatDecisionMessage({ ...base, status: "dismissed" })).toContain("stays as it was");
+    expect(formatDecisionMessage({ ...base, status: "expired" })).toContain("No answer in 30 minutes");
+    expect(formatDecisionMessage({ ...base, status: "no_action" })).toBe("");
+  });
+
+  it("announces recovery and the restored interval", () => {
+    expect(formatRecoveredMessage(base.url, "down", "resolved after 300s (was: ...)", 60)).toBe(
+      "✅ **down resolved: https://httpbin.org/status/503**: resolved after 300s (was: ...). Back to checking every 1 minute."
+    );
+    expect(formatRecoveredMessage(base.url, "error_burst", "resolved after 60s", null)).toBe(
+      "✅ **error burst resolved: https://httpbin.org/status/503**: resolved after 60s."
+    );
   });
 });

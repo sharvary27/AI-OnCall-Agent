@@ -2,13 +2,19 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { getAgentByName } from "agents";
 import { runFullCheck } from "./checks";
 import {
+  APPROVAL_TIMEOUT,
+  DECISION_EVENT,
   DIAGNOSIS_SYSTEM_PROMPT,
   buildEvidence,
   fallbackDiagnosis,
+  proposeAction,
   type EndpointContext,
   type Incident,
+  type IncidentStatus,
   type InvestigationParams
-} from "./Incident";
+} from "./incident";
+
+export type DecisionPayload = { decision: "approve" | "dismiss" };
 
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
@@ -34,6 +40,7 @@ export class InvestigationWorkflow extends WorkflowEntrypoint<Env, Investigation
       const probe = this.env.Probe.get(this.env.Probe.idFromName(params.url));
       const summary = await probe.getSummary(10);
       return {
+        intervalSec: summary.config?.intervalSec ?? 300,
         baseline: summary.baseline,
         uptimePct: summary.uptimePct,
         openAnomalies: summary.openAnomalies,
@@ -83,10 +90,20 @@ export class InvestigationWorkflow extends WorkflowEntrypoint<Env, Investigation
         ok: recheck.ok,
         error: recheck.error
       },
-      diagnosis
+      diagnosis,
+      proposal: null,
+      status: "no_action"
     };
+    incident.proposal = proposeAction(
+      params.anomaly.type,
+      context.intervalSec,
+      incident.stillOpen,
+      recheck.details.rateLimit
+    );
+    if (incident.proposal) incident.status = "awaiting_approval";
 
-    // 5. Hand the incident to the chat agent: it stores it and posts it in chat.
+    // 5. Hand the incident to the chat agent: it stores it and posts it in chat
+    //    (with the suggested action, if there is one).
     await step.do(
       "report to chat",
       { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
@@ -97,6 +114,38 @@ export class InvestigationWorkflow extends WorkflowEntrypoint<Env, Investigation
       }
     );
 
-    return incident;
+    if (!incident.proposal) return incident;
+
+    // 6. Human in the loop: pause until the user answers in chat. The Workflow
+    //    is suspended while it waits (no CPU, survives restarts). Timeout throws.
+    let status: IncidentStatus;
+    try {
+      const answer = await step.waitForEvent<DecisionPayload>("wait for approval", {
+        type: DECISION_EVENT,
+        timeout: APPROVAL_TIMEOUT
+      });
+      status = answer.payload?.decision === "approve" ? "approved" : "dismissed";
+    } catch {
+      status = "expired"; // nobody answered: do nothing
+    }
+
+    // 7. Apply the decision (only on approval), then tell the chat.
+    const proposal = incident.proposal;
+    const final: Incident = { ...incident, status };
+    await step.do(
+      "apply decision",
+      { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
+      async () => {
+        if (status === "approved") {
+          const probe = this.env.Probe.get(this.env.Probe.idFromName(params.url));
+          await probe.applyBackoff(proposal.intervalSec);
+        }
+        const agent = await getAgentByName(this.env.ChatAgent, params.agentName);
+        await agent.updateIncident(final);
+        return status;
+      }
+    );
+
+    return final;
   }
 }

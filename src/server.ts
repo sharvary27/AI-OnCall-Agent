@@ -13,11 +13,16 @@ import {
 import { z } from "zod";
 
 import { runFullCheck } from "./checks";
-import { formatIncidentMessage, type Incident } from "./Incident";
+import {
+  DECISION_EVENT,
+  formatDecisionMessage,
+  formatIncidentMessage,
+  type Incident
+} from "./incident";
 
 // The Worker entry must export every Durable Object and Workflow class.
 export { Probe } from "./probe";
-export { InvestigationWorkflow } from "./Investigate";
+export { InvestigationWorkflow } from "./investigate";
 
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
@@ -33,6 +38,7 @@ Tools:
 - inspectEndpoint: one-off deep check of any URL, without monitoring it.
 - getAlerts: open alerts and recent alert history across all endpoints.
 - getIncidents: past incidents with their automatic diagnosis.
+- respondToIncident: approve or dismiss the action suggested in an incident.
 - removeEndpoint: stop monitoring a URL.
 
 Alerts: each endpoint learns its normal latency (baseline) and raises alerts
@@ -44,6 +50,9 @@ Incidents: when an alert opens, an automatic investigation rechecks the endpoint
 compares it with its history and writes a diagnosis. These appear in this chat
 on their own, as messages starting with a colored icon. Use getIncidents to look
 them up (e.g. "what broke last night?", "why was it down?").
+Some incidents end with a "Suggested action" and wait for the user. When the user
+replies approve / yes / do it, call respondToIncident with decision "approve";
+for dismiss / no / leave it, use "dismiss". Never approve on the user's behalf.
 
 Reading check details:
 - dns: status NXDOMAIN means the domain does not exist; empty a/aaaa means it
@@ -231,21 +240,43 @@ export class ChatAgent extends AIChatAgent<Env> {
     await this.removeMcpServer(serverId);
   }
 
-  // Called by an InvestigationWorkflow (Durable Object RPC), not by the user.
-  // Stores the incident and posts it in the chat without the user asking.
+  // ---- Called by Workflows and Probes (Durable Object RPC), not by the user ----
+
+  // Adds an assistant message to the chat without the user asking.
+  // persistMessages saves it and pushes it to every open browser tab over the
+  // WebSocket WITHOUT triggering an LLM reply (saveMessages would also make the
+  // model respond to it).
+  async postMessage(text: string, id: string = crypto.randomUUID()): Promise<void> {
+    const message = {
+      id,
+      role: "assistant" as const,
+      parts: [{ type: "text" as const, text }]
+    };
+    await this.persistMessages([...this.messages, message]);
+  }
+
+  // A new incident from an investigation: store it and post it.
   async reportIncident(incident: Incident): Promise<void> {
+    this.saveIncident(incident);
+    await this.postMessage(formatIncidentMessage(incident), `incident-${incident.id}`);
+  }
+
+  // The approval step finished (approved / dismissed / expired).
+  async updateIncident(incident: Incident): Promise<void> {
+    this.saveIncident(incident);
+    const text = formatDecisionMessage(incident);
+    if (text) await this.postMessage(text);
+  }
+
+  private saveIncident(incident: Incident): void {
     this.sql`INSERT OR REPLACE INTO incidents (id, created_at, data)
              VALUES (${incident.id}, ${incident.createdAt}, ${JSON.stringify(incident)})`;
+  }
 
-    const message = {
-      id: `incident-${incident.id}`,
-      role: "assistant" as const,
-      parts: [{ type: "text" as const, text: formatIncidentMessage(incident) }]
-    };
-    // persistMessages saves the message and pushes it to every open browser
-    // tab over the WebSocket, WITHOUT triggering a new LLM reply.
-    // (saveMessages would also make the model respond to it.)
-    await this.persistMessages([...this.messages, message]);
+  private loadIncidents(): Incident[] {
+    return this.sql<IncidentRow>`SELECT * FROM incidents ORDER BY created_at DESC LIMIT 100`.map(
+      (r) => JSON.parse(r.data) as Incident
+    );
   }
 
   private probeFor(url: string) {
@@ -408,10 +439,8 @@ export class ChatAgent extends AIChatAgent<Env> {
           execute: async ({ url, limit }) => {
             try {
               const n = toInt(limit, 5, 1, 20);
-              const rows = this.sql<IncidentRow>`SELECT * FROM incidents ORDER BY created_at DESC LIMIT 100`;
               const filterUrl = url ? normalizeUrl(url) : null;
-              const incidents = rows
-                .map((r) => JSON.parse(r.data) as Incident)
+              const incidents = this.loadIncidents()
                 .filter((i) => !filterUrl || i.url === filterUrl)
                 .slice(0, n)
                 .map((i) => ({
@@ -421,11 +450,50 @@ export class ChatAgent extends AIChatAgent<Env> {
                   openedAt: new Date(i.openedAt).toISOString(),
                   stillOpenAtInvestigation: i.stillOpen,
                   alert: i.alertMessage,
-                  diagnosis: i.diagnosis
+                  diagnosis: i.diagnosis,
+                  suggestedAction: i.proposal?.summary ?? null,
+                  status: i.status ?? "no_action"
                 }));
               return incidents.length ? incidents : "No incidents recorded yet.";
             } catch (err) {
               console.error("getIncidents failed:", err);
+              return { error: errorMessage(err) };
+            }
+          }
+        }),
+
+        respondToIncident: tool({
+          description:
+            "Approve or dismiss the suggested action of the most recent incident that is waiting for the user's answer. Only call this when the user explicitly answers.",
+          inputSchema: z.object({
+            decision: z.enum(["approve", "dismiss"]).describe("The user's answer"),
+            url: z.string().optional().describe("Only needed if several incidents are waiting")
+          }),
+          execute: async ({ decision, url }) => {
+            try {
+              const filterUrl = url ? normalizeUrl(url) : null;
+              const pending = this.loadIncidents().find(
+                (i) => i.status === "awaiting_approval" && (!filterUrl || i.url === filterUrl)
+              );
+              if (!pending) return "There is no incident waiting for an answer.";
+
+              // Wake the paused Workflow (its id is the incident id).
+              const instance = await this.env.INVESTIGATION.get(pending.id);
+              await instance.sendEvent({ type: DECISION_EVENT, payload: { decision } });
+
+              // Mark it answered right away so it can't be answered twice;
+              // the Workflow posts the final confirmation.
+              this.saveIncident({
+                ...pending,
+                status: decision === "approve" ? "approved" : "dismissed"
+              });
+              return {
+                sent: decision,
+                url: pending.url,
+                note: "The investigation will apply this and confirm in chat."
+              };
+            } catch (err) {
+              console.error("respondToIncident failed:", err);
               return { error: errorMessage(err) };
             }
           }

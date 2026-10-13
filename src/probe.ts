@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { getAgentByName } from "agents";
 import { runFullCheck, type CheckDetails, type FullCheck } from "./checks";
 import {
   computeBaseline,
@@ -8,7 +9,7 @@ import {
   type CheckSample,
   type OpenAnomaly
 } from "./detect";
-import { shouldInvestigate } from "./Incident";
+import { formatRecoveredMessage, shouldInvestigate } from "./incident";
 
 // One Probe instance per monitored endpoint (named by its URL).
 // It runs a full network check, stores the result in its own SQLite table,
@@ -19,6 +20,8 @@ export type ProbeConfig = {
   intervalSec: number;
   active: boolean;
   agentName?: string; // the chat agent to report incidents to
+  // Set while an approved back-off is active: the interval to return to.
+  normalIntervalSec?: number;
 };
 
 const MAX_ROWS = 500; // keep the last 500 checks per endpoint
@@ -119,9 +122,27 @@ export class Probe extends DurableObject<Env> {
     try {
       await this.runCheck(config);
     } finally {
-      // Always schedule the next check, even if this one blew up.
-      await this.ctx.storage.setAlarm(Date.now() + config.intervalSec * 1000);
+      // Always schedule the next check, even if this one blew up. Re-read the
+      // config: this check may have just ended a back-off and changed the interval.
+      const latest = (await this.getConfig()) ?? config;
+      if (latest.active) {
+        await this.ctx.storage.setAlarm(Date.now() + latest.intervalSec * 1000);
+      }
     }
+  }
+
+  // Called by the investigation Workflow after the user approves a back-off.
+  async applyBackoff(intervalSec: number): Promise<ProbeConfig | null> {
+    const config = await this.getConfig();
+    if (!config?.active) return null;
+    const updated: ProbeConfig = {
+      ...config,
+      normalIntervalSec: config.normalIntervalSec ?? config.intervalSec,
+      intervalSec
+    };
+    await this.ctx.storage.put("config", updated);
+    await this.ctx.storage.setAlarm(Date.now() + intervalSec * 1000);
+    return updated;
   }
 
   // Recent checks plus simple stats, newest first. Full network details are
@@ -222,8 +243,45 @@ export class Probe extends DurableObject<Env> {
       );
     }
     await this.ctx.storage.put("openAnomalies", open);
+    const restoredIntervalSec = await this.endBackoffIfRecovered(open.length);
     await this.startInvestigations(events);
+    await this.announceRecoveries(events, restoredIntervalSec);
     return events;
+  }
+
+  // Once every alert has cleared, undo any approved back-off.
+  // Returns the restored interval, or null if nothing changed.
+  private async endBackoffIfRecovered(openCount: number): Promise<number | null> {
+    const config = await this.getConfig();
+    if (!config?.normalIntervalSec || openCount > 0) return null;
+    const restored = config.normalIntervalSec;
+    await this.ctx.storage.put("config", {
+      ...config,
+      intervalSec: restored,
+      normalIntervalSec: undefined
+    });
+    return restored;
+  }
+
+  // Tell the chat when an investigated alert resolves.
+  private async announceRecoveries(
+    events: AnomalyEvent[],
+    restoredIntervalSec: number | null
+  ): Promise<void> {
+    const config = await this.getConfig();
+    if (!config?.agentName) return;
+    const resolved = events.filter((e) => e.kind === "resolved" && shouldInvestigate(e.type));
+    if (resolved.length === 0) return;
+    try {
+      const agent = await getAgentByName(this.env.ChatAgent, config.agentName);
+      for (const [i, e] of resolved.entries()) {
+        // mention the restored interval once, on the last message
+        const restored = i === resolved.length - 1 ? restoredIntervalSec : null;
+        await agent.postMessage(formatRecoveredMessage(config.url, e.type, e.message, restored));
+      }
+    } catch (err) {
+      console.error(`could not announce recovery for ${config.url}:`, err);
+    }
   }
 
   // Each newly opened alert gets its own investigation Workflow. A failure to

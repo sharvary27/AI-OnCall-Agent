@@ -12,8 +12,12 @@ import {
 } from "ai";
 import { z } from "zod";
 
-// The Worker entry must export every Durable Object class.
+import { runFullCheck } from "./checks";
+import { formatIncidentMessage, type Incident } from "./Incident";
+
+// The Worker entry must export every Durable Object and Workflow class.
 export { Probe } from "./probe";
+export { InvestigationWorkflow } from "./Investigate";
 
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
@@ -24,8 +28,34 @@ and explain what happened in plain language.
 Tools:
 - addEndpoint: start monitoring a URL.
 - listEndpoints: see everything being monitored and its latest check.
-- getEndpointStatus: recent checks, uptime and average latency for one URL.
+- getEndpointStatus: recent checks, uptime, average latency and full network
+  details of the latest check for one monitored URL.
+- inspectEndpoint: one-off deep check of any URL, without monitoring it.
+- getAlerts: open alerts and recent alert history across all endpoints.
+- getIncidents: past incidents with their automatic diagnosis.
 - removeEndpoint: stop monitoring a URL.
+
+Alerts: each endpoint learns its normal latency (baseline) and raises alerts
+(down, error_burst, latency_spike, dns_failure, rate_limited, quota_low, blocked).
+"opened" means a problem started, "resolved" means it cleared. Lead with
+critical alerts, say when they started, and compare latency to the baseline.
+
+Incidents: when an alert opens, an automatic investigation rechecks the endpoint,
+compares it with its history and writes a diagnosis. These appear in this chat
+on their own, as messages starting with a colored icon. Use getIncidents to look
+them up (e.g. "what broke last night?", "why was it down?").
+
+Reading check details:
+- dns: status NXDOMAIN means the domain does not exist; empty a/aaaa means it
+  resolves to nothing; ms is the lookup time through 1.1.1.1.
+- redirects: each hop before the final page. A redirect to a login page usually
+  means the site requires sign-in or blocks bots.
+- rateLimit: rateLimited true means HTTP 429 or no quota left. Mention remaining
+  and resetSec / retryAfterSec when present (in seconds).
+- blockedHint: the site is blocking automated requests; explain it, don't call
+  the site "down".
+- security.missing: security headers the site doesn't send. Only mention these
+  if the user asks about security.
 
 Be direct and concise. Only state facts you got from a tool result; if you don't have
 data yet, say so instead of guessing.
@@ -135,6 +165,7 @@ function normalizeUrl(input: string): string {
 }
 
 type EndpointRow = { url: string; interval_sec: number; added_at: number };
+type IncidentRow = { id: string; created_at: number; data: string };
 
 // Keep tool schemas simple: Workers AI rejects complex JSON schemas
 // (unions / anyOf / null types) with an opaque "internal error".
@@ -165,6 +196,12 @@ export class ChatAgent extends AIChatAgent<Env> {
       interval_sec INTEGER NOT NULL,
       added_at     INTEGER NOT NULL
     )`;
+    // Incidents reported by investigation Workflows (full record as JSON).
+    this.sql`CREATE TABLE IF NOT EXISTS incidents (
+      id         TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      data       TEXT NOT NULL
+    )`;
 
     // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
@@ -192,6 +229,23 @@ export class ChatAgent extends AIChatAgent<Env> {
   @callable()
   async removeServer(serverId: string) {
     await this.removeMcpServer(serverId);
+  }
+
+  // Called by an InvestigationWorkflow (Durable Object RPC), not by the user.
+  // Stores the incident and posts it in the chat without the user asking.
+  async reportIncident(incident: Incident): Promise<void> {
+    this.sql`INSERT OR REPLACE INTO incidents (id, created_at, data)
+             VALUES (${incident.id}, ${incident.createdAt}, ${JSON.stringify(incident)})`;
+
+    const message = {
+      id: `incident-${incident.id}`,
+      role: "assistant" as const,
+      parts: [{ type: "text" as const, text: formatIncidentMessage(incident) }]
+    };
+    // persistMessages saves the message and pushes it to every open browser
+    // tab over the WebSocket, WITHOUT triggering a new LLM reply.
+    // (saveMessages would also make the model respond to it.)
+    await this.persistMessages([...this.messages, message]);
   }
 
   private probeFor(url: string) {
@@ -232,7 +286,12 @@ export class ChatAgent extends AIChatAgent<Env> {
             try {
               const normalized = normalizeUrl(url);
               const interval = toInt(intervalSeconds, 300, 60, 3600);
-              const firstCheck = await this.probeFor(normalized).configure(normalized, interval);
+              // Pass this chat's name so the Probe knows where to report incidents.
+              const firstCheck = await this.probeFor(normalized).configure(
+                normalized,
+                interval,
+                this.name
+              );
               this.sql`INSERT OR REPLACE INTO endpoints (url, interval_sec, added_at)
                        VALUES (${normalized}, ${interval}, ${Date.now()})`;
               return { monitoring: normalized, intervalSeconds: interval, firstCheck };
@@ -256,12 +315,31 @@ export class ChatAgent extends AIChatAgent<Env> {
                   return {
                     url: r.url,
                     intervalSeconds: r.interval_sec,
-                    latest: summary.checks[0] ?? null
+                    latest: summary.checks[0] ?? null,
+                    rateLimited: summary.latestDetails?.rateLimit?.rateLimited ?? false,
+                    blockedHint: summary.latestDetails?.blockedHint ?? null,
+                    openAlerts: summary.openAnomalies.map((a) => `${a.severity}: ${a.type}`)
                   };
                 })
               );
             } catch (err) {
               console.error("listEndpoints failed:", err);
+              return { error: errorMessage(err) };
+            }
+          }
+        }),
+
+        inspectEndpoint: tool({
+          description:
+            "Run one deep network check of any URL right now (DNS, redirects, rate-limit and security headers) without adding it to monitoring.",
+          inputSchema: z.object({
+            url: z.string().describe("The URL to inspect, e.g. https://example.com")
+          }),
+          execute: async ({ url }) => {
+            try {
+              return await runFullCheck(normalizeUrl(url));
+            } catch (err) {
+              console.error("inspectEndpoint failed:", err);
               return { error: errorMessage(err) };
             }
           }
@@ -283,6 +361,71 @@ export class ChatAgent extends AIChatAgent<Env> {
               return await this.probeFor(normalized).getSummary(toInt(limit, 20, 1, 100));
             } catch (err) {
               console.error("getEndpointStatus failed:", err);
+              return { error: errorMessage(err) };
+            }
+          }
+        }),
+
+        getAlerts: tool({
+          description:
+            "Show open alerts (down, latency spikes, rate limiting, DNS failures, ...) across all monitored endpoints, plus recent alert history. Use for questions like 'is anything wrong?' or 'what broke?'.",
+          inputSchema: z.object({
+            historyLimit: looseNumber.describe(
+              "How many recent alert events per endpoint to include (1 to 50). Defaults to 10."
+            )
+          }),
+          execute: async ({ historyLimit }) => {
+            try {
+              const rows = this.sql<EndpointRow>`SELECT * FROM endpoints ORDER BY added_at`;
+              if (rows.length === 0) return "No endpoints are being monitored yet.";
+              const limit = toInt(historyLimit, 10, 1, 50);
+              const perEndpoint = await Promise.all(
+                rows.map(async (r) => {
+                  const probe = this.probeFor(r.url);
+                  const [open, history] = await Promise.all([
+                    probe.getOpenAnomalies(),
+                    probe.getEvents(limit)
+                  ]);
+                  return { url: r.url, open, history };
+                })
+              );
+              const openCount = perEndpoint.reduce((n, e) => n + e.open.length, 0);
+              return { openAlertCount: openCount, endpoints: perEndpoint };
+            } catch (err) {
+              console.error("getAlerts failed:", err);
+              return { error: errorMessage(err) };
+            }
+          }
+        }),
+
+        getIncidents: tool({
+          description:
+            "Look up past incidents (automatic investigations of alerts) with their diagnosis, newest first. Optionally filter by URL.",
+          inputSchema: z.object({
+            url: z.string().optional().describe("Only incidents for this URL"),
+            limit: looseNumber.describe("How many incidents (1 to 20). Defaults to 5.")
+          }),
+          execute: async ({ url, limit }) => {
+            try {
+              const n = toInt(limit, 5, 1, 20);
+              const rows = this.sql<IncidentRow>`SELECT * FROM incidents ORDER BY created_at DESC LIMIT 100`;
+              const filterUrl = url ? normalizeUrl(url) : null;
+              const incidents = rows
+                .map((r) => JSON.parse(r.data) as Incident)
+                .filter((i) => !filterUrl || i.url === filterUrl)
+                .slice(0, n)
+                .map((i) => ({
+                  url: i.url,
+                  type: i.type,
+                  severity: i.severity,
+                  openedAt: new Date(i.openedAt).toISOString(),
+                  stillOpenAtInvestigation: i.stillOpen,
+                  alert: i.alertMessage,
+                  diagnosis: i.diagnosis
+                }));
+              return incidents.length ? incidents : "No incidents recorded yet.";
+            } catch (err) {
+              console.error("getIncidents failed:", err);
               return { error: errorMessage(err) };
             }
           }

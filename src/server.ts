@@ -13,12 +13,13 @@ import {
 import { z } from "zod";
 
 import { runFullCheck } from "./checks";
+import { POSTMORTEM_INSTRUCTIONS, buildPostmortemData } from "./Postmortem";
 import {
   DECISION_EVENT,
   formatDecisionMessage,
   formatIncidentMessage,
   type Incident
-} from "./incident";
+} from "./Incident";
 
 // The Worker entry must export every Durable Object and Workflow class.
 export { Probe } from "./probe";
@@ -39,6 +40,7 @@ Tools:
 - getAlerts: open alerts and recent alert history across all endpoints.
 - getIncidents: past incidents with their automatic diagnosis.
 - respondToIncident: approve or dismiss the action suggested in an incident.
+- getPostmortemData: facts and timeline for writing a postmortem of an incident.
 - removeEndpoint: stop monitoring a URL.
 
 Alerts: each endpoint learns its normal latency (baseline) and raises alerts
@@ -53,6 +55,8 @@ them up (e.g. "what broke last night?", "why was it down?").
 Some incidents end with a "Suggested action" and wait for the user. When the user
 replies approve / yes / do it, call respondToIncident with decision "approve";
 for dismiss / no / leave it, use "dismiss". Never approve on the user's behalf.
+When asked for a postmortem or incident report, call getPostmortemData and follow
+the instructions it returns.
 
 Reading check details:
 - dns: status NXDOMAIN means the domain does not exist; empty a/aaaa means it
@@ -263,6 +267,7 @@ export class ChatAgent extends AIChatAgent<Env> {
 
   // The approval step finished (approved / dismissed / expired).
   async updateIncident(incident: Incident): Promise<void> {
+    incident = { ...incident, decidedAt: incident.decidedAt ?? Date.now() };
     this.saveIncident(incident);
     const text = formatDecisionMessage(incident);
     if (text) await this.postMessage(text);
@@ -457,6 +462,34 @@ export class ChatAgent extends AIChatAgent<Env> {
               return incidents.length ? incidents : "No incidents recorded yet.";
             } catch (err) {
               console.error("getIncidents failed:", err);
+              return { error: errorMessage(err) };
+            }
+          }
+        }),
+
+        getPostmortemData: tool({
+          description:
+            "Get the facts and timeline of an incident (impact start, detection, duration, failed checks, diagnosis, action taken, resolution) for writing a postmortem. Defaults to the most recent incident.",
+          inputSchema: z.object({
+            url: z.string().optional().describe("Endpoint of the incident; omit for the most recent")
+          }),
+          execute: async ({ url }) => {
+            try {
+              const filterUrl = url ? normalizeUrl(url) : null;
+              const incident = this.loadIncidents().find((i) => !filterUrl || i.url === filterUrl);
+              if (!incident) return "No incidents recorded yet.";
+              const now = Date.now();
+              // From 30 minutes before the alert, to now.
+              const history = await this.probeFor(incident.url).getHistory(
+                incident.openedAt - 30 * 60_000,
+                now
+              );
+              return {
+                instructions: POSTMORTEM_INSTRUCTIONS,
+                data: buildPostmortemData(incident, history.events, history.checks, now)
+              };
+            } catch (err) {
+              console.error("getPostmortemData failed:", err);
               return { error: errorMessage(err) };
             }
           }

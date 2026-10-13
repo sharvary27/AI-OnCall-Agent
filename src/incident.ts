@@ -25,6 +25,7 @@ export type Incident = {
   diagnosis: string;
   proposal: Proposal | null; // what the agent suggests doing, if anything
   status: IncidentStatus;
+  decidedAt?: number; // when the approval step finished
 };
 
 // Lifecycle of the human-approval step.

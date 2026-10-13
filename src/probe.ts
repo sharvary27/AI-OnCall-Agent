@@ -92,7 +92,20 @@ export class Probe extends DurableObject<Env> {
     const config = await this.getConfig();
     if (config) await this.ctx.storage.put("config", { ...config, active: false });
     await this.ctx.storage.deleteAlarm();
-    // Stopping monitoring closes any open alerts.
+    // Stopping monitoring closes any open alerts. Record that, so the history
+    // shows where each alert ended (postmortems rely on it).
+    const now = Date.now();
+    const { events } = diffAnomalies(await this.getOpenAnomalies(), [], now);
+    for (const e of events) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO events (ts, kind, type, severity, message) VALUES (?, ?, ?, ?, ?)`,
+        e.ts,
+        e.kind,
+        e.type,
+        e.severity,
+        `${e.message}; monitoring stopped`
+      );
+    }
     await this.ctx.storage.put("openAnomalies", []);
   }
 
@@ -109,6 +122,34 @@ export class Probe extends DurableObject<Env> {
       )
       .toArray()
       .map((e) => ({ ...e, time: new Date(e.ts).toISOString() }));
+  }
+
+  // Raw events and checks in a time range, for postmortems (oldest first).
+  async getHistory(fromTs: number, toTs: number) {
+    const events = this.ctx.storage.sql
+      .exec<EventRow>(
+        `SELECT ts, kind, type, severity, message FROM events
+         WHERE ts BETWEEN ? AND ? ORDER BY id ASC`,
+        fromTs,
+        toTs
+      )
+      .toArray();
+    const checks = this.ctx.storage.sql
+      .exec<CheckRow>(
+        `SELECT ts, status, latency_ms, ok, error, details FROM checks
+         WHERE ts BETWEEN ? AND ? ORDER BY id ASC LIMIT 500`,
+        fromTs,
+        toTs
+      )
+      .toArray()
+      .map((r) => ({
+        ts: r.ts,
+        status: r.status,
+        latencyMs: r.latency_ms,
+        ok: r.ok === 1,
+        error: r.error
+      }));
+    return { events, checks };
   }
 
   async getConfig(): Promise<ProbeConfig | null> {

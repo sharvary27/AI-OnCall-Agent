@@ -1,245 +1,136 @@
-# Agent Starter
+# cf_ai_oncall
 
-![npm i agents command](./npm-agents-banner.svg)
+An AI on-call engineer for your web services, built entirely on Cloudflare.
 
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/agents-starter"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/></a>
+It watches your endpoints from Cloudflare's edge, learns what "normal" looks like for each one, and when something breaks it investigates on its own, writes a diagnosis with Llama 3.3, and posts it in your chat. If it wants to change something, it asks first and waits for your answer.
 
-A starter template for building AI chat agents on Cloudflare, powered by the [Agents SDK](https://developers.cloudflare.com/agents/).
+**Live demo:** https://cf-ai-oncall.sharvary-salgaonkar27.workers.dev
 
-Uses Workers AI (no API key required), with tools for weather, timezone detection, calculations with approval, task scheduling, and vision (image input).
+<!-- Add a screenshot or GIF here: docs/demo.gif -->
 
-## Quick start
+## Try it
 
-```bash
-npx create-cloudflare@latest --template cloudflare/agents-starter
-cd agents-starter
-npm install
-npm run dev
+Open the demo and click one of the example prompts, or type:
+
+| Prompt | What happens |
+|---|---|
+| `Monitor https://example.com every 60 seconds` | Starts a Probe that checks the URL every minute from the edge |
+| `Inspect https://api.github.com/users/octocat` | One deep check: DNS via 1.1.1.1, redirect chain, rate-limit headers, security headers |
+| `Monitor https://httpbin.org/status/503 every 60 seconds` | A failing endpoint. Wait about 3 minutes **without typing**: an incident with a diagnosis and a suggested action appears on its own |
+| `approve` | Answers the paused investigation; the agent backs off checks and confirms |
+| `Is anything wrong?` | Open alerts and recent alert history |
+| `Write a postmortem for the latest incident` | A blameless postmortem built from the recorded timeline |
+
+Each browser gets its own private agent (up to 5 monitored endpoints per session).
+
+## How it maps to the assignment
+
+| Requirement | Implementation |
+|---|---|
+| **LLM** | Llama 3.3 70B (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`) on Workers AI: chat with tool calling, plus incident diagnosis |
+| **Workflow / coordination** | Durable Object alarms schedule the checks; a **Cloudflare Workflow** runs each investigation as durable, retried steps and **pauses for human approval** (`waitForEvent`) |
+| **User input** | Chat UI over WebSockets (Agents SDK, `AIChatAgent`), served by the same Worker |
+| **Memory / state** | Durable Object SQLite: chat history, endpoints, every check result, alert events and incidents |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    B[Browser chat UI] <-->|WebSocket| W[Worker]
+    W --> C[ChatAgent<br/>Durable Object<br/>one per visitor]
+    C <-->|tool calls| L[Workers AI<br/>Llama 3.3]
+    C -->|add / inspect / status| P[Probe<br/>Durable Object<br/>one per URL]
+    P -->|alarm every N sec| P
+    P -->|DNS over HTTPS| D[1.1.1.1]
+    P -->|HTTP check| T[Monitored endpoint]
+    P -->|alert opened| WF[InvestigationWorkflow]
+    WF -->|recheck + history| P
+    WF -->|diagnosis| L
+    WF -->|incident + proposal| C
+    C -->|user approves| WF
+    WF -->|back off| P
 ```
 
-> **Cloudflare authentication is required to run locally.** This template uses
-> Workers AI with `"ai": { "remote": true }` in `wrangler.jsonc`, and Workers AI
-> has no local simulator — so `npm run dev` opens a remote proxy session against
-> Cloudflare and needs you to be authenticated. Either run `wrangler login` once
-> in an interactive terminal, or set a `CLOUDFLARE_API_TOKEN` environment
-> variable (e.g. in a `.env` file). No third-party (OpenAI/Anthropic) key is
-> needed, but a Cloudflare login is.
+**The flow:** a Probe checks its URL on a timer and runs anomaly detection after every check. When an alert opens, it starts an investigation Workflow: wait 30s to rule out a blip, recheck, gather history, ask Llama 3.3 for a diagnosis, post the incident to the chat, then **pause** until the user approves or dismisses the suggested action (30 minute timeout). On approval the Probe slows its checks; when the alert resolves it restores the normal interval and announces the recovery.
 
-Open [http://localhost:5173](http://localhost:5173) to see your agent in action.
+## What it detects
 
-Try these prompts to see the different features:
+Each endpoint builds a baseline (median and p90 latency, error rate) from its own history.
 
-- **"What's the weather in Paris?"** — server-side tool (runs automatically)
-- **"What timezone am I in?"** — client-side tool (browser provides the answer)
-- **"Calculate 5000 \* 3"** — approval tool (asks you before running)
-- **"Remind me in 5 minutes to take a break"** — scheduling
-- **Drop an image and ask "What's in this image?"** — vision (image understanding)
+| Alert | Rule | Severity |
+|---|---|---|
+| `down` | 2 failed checks in a row | critical |
+| `error_burst` | 3+ failures in the last 6 checks | warning |
+| `latency_spike` | 2 checks in a row above max(3× median, median + 300ms) | warning |
+| `dns_failure` | NXDOMAIN or SERVFAIL from 1.1.1.1 | critical |
+| `rate_limited` | HTTP 429 or zero quota left | warning |
+| `quota_low` | 10% or less of the rate-limit quota left (warns *before* the 429) | warning |
+| `blocked` | bot blocking (LinkedIn's 999, Cloudflare challenge, redirect to a login wall) | warning |
+
+Requiring two consecutive bad checks avoids paging on one-off blips. Blocking and rate limiting are reported separately, so a site that blocks bots isn't reported as "down". Alerts open once and resolve once, so one incident produces one alert, not one per check.
+
+Rate-limit parsing handles `X-RateLimit-*`, `RateLimit-*`, the combined `RateLimit` header (both IETF draft formats), `Retry-After` as seconds or an HTTP date, and reset values sent as unix timestamps (GitHub style).
+
+## Design decisions
+
+- **Deterministic data path, LLM control path.** Checks, detection, baselines and postmortem numbers are plain TypeScript. The LLM explains, diagnoses and drives tools; it never decides whether something is down or computes a duration. This keeps the facts reproducible and testable, and the model can't invent numbers.
+- **One Durable Object per endpoint.** Each Probe has its own SQLite history and its own alarm, so endpoints are isolated and checks keep running when nobody is connected.
+- **Workflows for investigations.** Each step's result is persisted, so a failure retries that step instead of the whole investigation, and `waitForEvent` lets it wait 30 minutes for a human at no cost.
+- **Ask before acting.** The only action the agent can take (backing off checks) requires explicit approval and undoes itself on recovery.
+- **Public demo safety.** Per-visitor sessions (a random agent name stored in localStorage) and a cap of 5 endpoints per session.
+
+## Debugging notes
+
+Things that broke along the way, and how they were fixed:
+
+1. **Every streamed word arrived twice** with Llama 3.3 (`workers-ai-provider` 3.3.1). Logging text deltas on the server showed the duplication happened before the UI. Fixed with a small AI SDK middleware (`wrapLanguageModel`) that drops the second copy of each duplicated delta, while keeping real repeats like "ha ha".
+2. **Tool calls failed with an opaque "An error occurred."** The debugger showed the tool arguments were doubled too: `{"url": "{"url": "httpshttps://://...`. The middleware now also dedupes tool-input deltas and, if the final JSON is still invalid, rebuilds it by un-doubling the string (a small backtracking search that keeps the first result that parses).
+3. **The model called the same tool in a loop.** Fixed with `prepareStep`: once a step has run tools, the next step gets no tools, so the model must answer with the results.
+4. **No incident appeared** after adding the Workflow. The `down` alert had been open since before the Workflow existed, and investigations only start when an alert *opens*. Found by checking each link of the chain from chat, then adding stage-by-stage logs.
+5. **Postmortems blamed the wrong session.** Stopping monitoring cleared alerts silently, so a postmortem walked back into an earlier session. Now `stop()` records a "monitoring stopped" resolution, and the impact search stops at the previous alert's end.
 
 ## Project structure
 
 ```
 src/
-  server.ts    # Chat agent with tools and scheduling
-  app.tsx      # Chat UI built with Kumo components
-  client.tsx   # React entry point
-  styles.css   # Tailwind + Kumo styles
+  server.ts        Worker entry + ChatAgent (chat, tools, incidents)
+  probe.ts         Probe Durable Object (scheduled checks, detection, back-off)
+  checks.ts        One full network check (DNS, redirects, headers, block hints)
+  detect.ts        Baselines, anomaly rules, open/resolve lifecycle
+  investigate.ts   InvestigationWorkflow (recheck, diagnose, approval)
+  incident.ts      Evidence, proposals, chat message formatting
+  postmortem.ts    Incident timeline and impact numbers
+  app.tsx          React chat UI
+test/              Vitest unit tests for all the pure logic (67 tests)
 ```
 
-## What's included
+## Run it locally
 
-- **AI Chat** — Streaming responses powered by Workers AI via `AIChatAgent`
-- **Image input** — Drag-and-drop, paste, or click to attach images for vision-capable models
-- **Three tool patterns** — server-side auto-execute, client-side (browser), and human-in-the-loop approval
-- **Scheduling** — one-time, delayed, and recurring (cron) tasks
-- **Reasoning display** — shows model thinking as it streams, collapses when done
-- **Debug mode** — toggle in the header to inspect raw message JSON for each message
-- **Kumo UI** — Cloudflare's design system with dark/light mode
-- **Real-time** — WebSocket connection with automatic reconnection and message persistence
-
-## Making it your own
-
-### Name your project
-
-Update the name in `package.json` and `wrangler.jsonc` — the `name` in `wrangler.jsonc` becomes your deployed Worker's URL (`<name>.<subdomain>.workers.dev`).
-
-### Change the system prompt
-
-Edit the `system` string in `server.ts` to give your agent a different personality or focus area. This is the most impactful single change you can make.
-
-### Replace the demo tools with real ones
-
-The starter ships with demo tools (`getWeather` returns random data, `calculate` does basic arithmetic). Replace them with real implementations:
-
-```ts
-// In server.ts, replace a demo tool with a real API call:
-getWeather: tool({
-  description: "Get the current weather for a city",
-  inputSchema: z.object({ city: z.string() }),
-  execute: async ({ city }) => {
-    const res = await fetch(`https://api.weather.example/${city}`);
-    return res.json();
-  }
-}),
-```
-
-### Add your own tools
-
-Add new tools to the `tools` object in `server.ts`. There are three patterns:
-
-```ts
-// Auto-execute: runs on the server, no user interaction
-myTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ }),
-  execute: async (input) => { /* return result */ }
-}),
-
-// Client-side: no execute function, browser provides the result
-// Handle it in app.tsx via the onToolCall callback
-browserTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ })
-}),
-
-// Approval: add needsApproval to gate execution
-sensitiveTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ }),
-  needsApproval: async (input) => true, // or conditional logic
-  execute: async (input) => { /* runs after approval */ }
-}),
-```
-
-### Customize scheduled task behavior
-
-When a scheduled task fires, `executeTask` runs on the server. It does its work and then uses `this.broadcast()` to notify connected clients (shown as a toast notification in the UI). Replace it with your own logic:
-
-```ts
-async executeTask(description: string, task: Schedule<string>) {
-  // Do the actual work
-  await sendEmail({ to: "user@example.com", subject: description });
-
-  // Notify connected clients
-  this.broadcast(
-    JSON.stringify({ type: "scheduled-task", description, timestamp: new Date().toISOString() })
-  );
-}
-```
-
-> **Why `broadcast()` instead of `saveMessages()`?** Injecting into chat history can cause the AI to see the notification as new context and re-trigger the same task in a loop. `broadcast()` sends a one-off event that the client displays separately from the conversation.
-
-### Remove scheduling
-
-If you don't need scheduling, remove `scheduleTask`, `getScheduledTasks`, and `cancelScheduledTask` from the tools object, the `executeTask` method, and the schedule-related imports (`getSchedulePrompt`, `scheduleSchema`, `Schedule`).
-
-### Add state beyond chat messages
-
-Use `this.setState()` and `this.state` for real-time state that syncs to all connected clients. See [Store and sync state](https://developers.cloudflare.com/agents/api-reference/store-and-sync-state/).
-
-### Add callable methods
-
-Expose agent methods as typed RPC that your client can call directly:
-
-```ts
-import { callable } from "agents";
-
-export class ChatAgent extends AIChatAgent<Env> {
-  @callable()
-  async getStats() {
-    return { messageCount: this.messages.length };
-  }
-}
-
-// Client-side:
-const stats = await agent.call("getStats");
-```
-
-See [Callable methods](https://developers.cloudflare.com/agents/api-reference/callable-methods/).
-
-### Connect to MCP servers
-
-Add external tools from MCP servers:
-
-```ts
-async onChatMessage(onFinish, options) {
-  // Connect to an MCP server
-  await this.mcp.connect("https://my-mcp-server.example/sse");
-
-  const result = streamText({
-    // ...
-    tools: {
-      ...myTools,
-      ...this.mcp.getAITools() // Include MCP tools
-    }
-  });
-}
-```
-
-See [MCP Client API](https://developers.cloudflare.com/agents/api-reference/mcp-client-api/).
-
-## Use a different AI model provider
-
-The starter uses [Workers AI](https://developers.cloudflare.com/workers-ai/) by default (no API key needed). To use a different provider:
-
-### OpenAI
+Requirements: Node 18+, a Cloudflare account (the free plan works).
 
 ```bash
-npm install @ai-sdk/openai
+git clone https://github.com/sharvary27/AI-OnCall-Agent.git
+cd AI-OnCall-Agent
+npm install
+npx wrangler login
+npm run dev
 ```
 
-```ts
-// In server.ts, replace the model:
-import { openai } from "@ai-sdk/openai";
-
-// Inside onChatMessage:
-const result = streamText({
-  model: openai("gpt-5.2")
-  // ...
-});
-```
-
-Create a `.env` file with your API key:
-
-```
-OPENAI_API_KEY=your-key-here
-```
-
-### Anthropic
+Workers AI has no local simulator, so `npm run dev` runs inference on Cloudflare. Your account needs a `workers.dev` subdomain (Workers & Pages in the dashboard).
 
 ```bash
-npm install @ai-sdk/anthropic
+npm test          # unit tests
+npm run deploy    # deploy to your workers.dev subdomain
 ```
 
-```ts
-import { anthropic } from "@ai-sdk/anthropic";
+## Limitations
 
-const result = streamText({
-  model: anthropic("claude-sonnet-4-20250514")
-  // ...
-});
-```
+- **No TLS certificate details.** Workers' `fetch` doesn't expose the certificate, so expiry can't be checked; an invalid certificate shows up as a failed request.
+- **Checks run from one location per Probe,** not from multiple regions, so a regional outage elsewhere won't be seen.
+- **Latency is time to response headers** measured inside a Worker, not full page load.
+- **The only automated action is backing off checks.** Real remediation (restarts, rollbacks) is out of scope on purpose.
+- **Llama 3.3 on Workers AI streams duplicated deltas** with the current provider version; the middleware works around it and can be removed once that's fixed upstream.
 
-Create a `.env` file with your API key:
+## AI-assisted development
 
-```
-ANTHROPIC_API_KEY=your-key-here
-```
-
-## Deploy
-
-```bash
-npm run deploy
-```
-
-Your agent is live on Cloudflare's global network. Messages persist in SQLite, streams resume on disconnect, and the agent hibernates when idle.
-
-## Learn more
-
-- [Agents SDK documentation](https://developers.cloudflare.com/agents/)
-- [Build a chat agent tutorial](https://developers.cloudflare.com/agents/getting-started/build-a-chat-agent/)
-- [Chat agents API reference](https://developers.cloudflare.com/agents/api-reference/chat-agents/)
-- [Workers AI models](https://developers.cloudflare.com/workers-ai/models/)
-
-## License
-
-MIT
+Built with AI assistance (Claude). The full prompt history is in [PROMPTS.md](./PROMPTS.md).

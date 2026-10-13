@@ -14,7 +14,7 @@ import {
   Switch,
   Text
 } from "@cloudflare/kumo";
-import { Toasty, useKumoToastManager } from "@cloudflare/kumo/components/toast";
+import { Toasty } from "@cloudflare/kumo/components/toast";
 import { Streamdown } from "streamdown";
 import { code } from "@streamdown/code";
 import {
@@ -66,6 +66,31 @@ function fileToDataUri(file: File): Promise<string> {
     reader.readAsDataURL(file);
   });
 }
+
+// ── Session ───────────────────────────────────────────────────────────
+
+// Each browser gets its own private on-call agent, remembered across reloads.
+// Without this, every visitor would share one agent instance ("default").
+function getSessionName(): string {
+  const KEY = "oncall-session";
+  try {
+    const existing = localStorage.getItem(KEY);
+    if (existing) return existing;
+    const created = `s-${crypto.randomUUID()}`;
+    localStorage.setItem(KEY, created);
+    return created;
+  } catch {
+    // storage blocked (private mode etc.): a fresh session per page load
+    return `s-${crypto.randomUUID()}`;
+  }
+}
+
+const SUGGESTED_PROMPTS = [
+  "Monitor https://example.com every 60 seconds",
+  "Inspect https://api.github.com/users/octocat",
+  "Is anything wrong?",
+  "Write a postmortem for the latest incident"
+];
 
 // ── Small components ──────────────────────────────────────────────────
 
@@ -268,7 +293,7 @@ function Chat() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const toasts = useKumoToastManager();
+  const [sessionName] = useState(getSessionName);
   const [mcpState, setMcpState] = useState<MCPServersState>({
     prompts: [],
     resources: [],
@@ -283,6 +308,7 @@ function Chat() {
 
   const agent = useAgent<ChatAgent>({
     agent: "ChatAgent",
+    name: sessionName,
     onOpen: useCallback(() => setConnected(true), []),
     onClose: useCallback(() => setConnected(false), []),
     onError: useCallback(
@@ -291,24 +317,7 @@ function Chat() {
     ),
     onMcpUpdate: useCallback((state: MCPServersState) => {
       setMcpState(state);
-    }, []),
-    onMessage: useCallback(
-      (message: MessageEvent) => {
-        try {
-          const data = JSON.parse(String(message.data));
-          if (data.type === "scheduled-task") {
-            toasts.add({
-              title: "Scheduled task completed",
-              description: data.description,
-              timeout: 0
-            });
-          }
-        } catch {
-          // Not JSON or not our event
-        }
-      },
-      [toasts]
-    )
+    }, [])
   });
 
   // Close MCP panel when clicking outside
@@ -360,18 +369,7 @@ function Chat() {
     status
   } = useAgentChat({
     agent,
-    experimental_throttle: 100,
-    onToolCall: async ({ toolCall, addToolOutput }) => {
-      if (toolCall.toolName === "getUserTimezone") {
-        addToolOutput({
-          toolCallId: toolCall.toolCallId,
-          output: {
-            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-            localTime: new Date().toLocaleTimeString()
-          }
-        });
-      }
-    }
+    experimental_throttle: 100
   });
 
   const isStreaming = status === "streaming" || status === "submitted";
@@ -488,11 +486,11 @@ function Chat() {
         <div className="max-w-3xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
             <h1 className="text-lg font-semibold text-kumo-default">
-              <span className="mr-2">⛅</span>Agent Starter
+              <span className="mr-2">🚨</span>On-Call Agent
             </h1>
             <Badge variant="secondary">
               <ChatCircleDotsIcon size={12} weight="bold" className="mr-1" />
-              AI Chat
+              Llama 3.3 on Workers AI
             </Badge>
           </div>
           <div className="flex items-center gap-3">
@@ -700,15 +698,10 @@ function Chat() {
           {messages.length === 0 && (
             <Empty
               icon={<ChatCircleDotsIcon size={32} />}
-              title="Start a conversation"
+              title="Your AI on-call engineer"
               contents={
                 <div className="flex flex-wrap justify-center gap-2">
-                  {[
-                    "What's the weather in Paris?",
-                    "What timezone am I in?",
-                    "Calculate 5000 * 3",
-                    "Remind me in 5 minutes to take a break"
-                  ].map((prompt) => (
+                  {SUGGESTED_PROMPTS.map((prompt) => (
                     <Button
                       key={prompt}
                       variant="outline"

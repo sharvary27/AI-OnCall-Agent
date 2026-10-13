@@ -13,19 +13,24 @@ import {
 import { z } from "zod";
 
 import { runFullCheck } from "./checks";
-import { POSTMORTEM_INSTRUCTIONS, buildPostmortemData } from "./Postmortem";
+import { POSTMORTEM_INSTRUCTIONS, buildPostmortemData } from "./postmortem";
 import {
   DECISION_EVENT,
   formatDecisionMessage,
   formatIncidentMessage,
   type Incident
-} from "./Incident";
+} from "./incident";
 
 // The Worker entry must export every Durable Object and Workflow class.
 export { Probe } from "./probe";
 export { InvestigationWorkflow } from "./investigate";
 
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
+// The demo is public: cap how many endpoints one visitor can monitor, so a
+// single session can't turn the Worker into a load generator or burn the
+// Workers AI quota.
+const MAX_ENDPOINTS = 5;
 
 const SYSTEM_PROMPT = `You are an on-call engineer assistant for the user's deployed services.
 You help them monitor endpoints, investigate outages, latency spikes and rate limiting,
@@ -321,6 +326,12 @@ export class ChatAgent extends AIChatAgent<Env> {
           execute: async ({ url, intervalSeconds }) => {
             try {
               const normalized = normalizeUrl(url);
+              const count = this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM endpoints`[0]?.n ?? 0;
+              if (count >= MAX_ENDPOINTS && !this.isMonitored(normalized)) {
+                return {
+                  error: `Limit reached: this demo monitors at most ${MAX_ENDPOINTS} endpoints per session. Remove one first.`
+                };
+              }
               const interval = toInt(intervalSeconds, 300, 60, 3600);
               // Pass this chat's name so the Probe knows where to report incidents.
               const firstCheck = await this.probeFor(normalized).configure(
@@ -518,7 +529,8 @@ export class ChatAgent extends AIChatAgent<Env> {
               // the Workflow posts the final confirmation.
               this.saveIncident({
                 ...pending,
-                status: decision === "approve" ? "approved" : "dismissed"
+                status: decision === "approve" ? "approved" : "dismissed",
+                decidedAt: Date.now()
               });
               return {
                 sent: decision,

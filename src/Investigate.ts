@@ -62,7 +62,8 @@ export class InvestigationWorkflow extends WorkflowEntrypoint<Env, Investigation
           return out.response.trim();
         }
       );
-    } catch {
+    } catch (err) {
+      console.error("diagnosis failed, using fallback:", err);
       // All retries failed: still report the raw facts rather than nothing.
       diagnosis = fallbackDiagnosis(evidence);
     }

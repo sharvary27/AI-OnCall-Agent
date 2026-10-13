@@ -10,18 +10,19 @@ It watches your endpoints from Cloudflare's edge, learns what "normal" looks lik
 
 ## Try it
 
-Open the demo and click one of the example prompts, or type:
+## Testing the live demo
 
-| Prompt | What happens |
-|---|---|
-| `Monitor https://example.com every 60 seconds` | Starts a Probe that checks the URL every minute from the edge |
-| `Inspect https://api.github.com/users/octocat` | One deep check: DNS via 1.1.1.1, redirect chain, rate-limit headers, security headers |
-| `Monitor https://httpbin.org/status/503 every 60 seconds` | A failing endpoint. Wait about 3 minutes **without typing**: an incident with a diagnosis and a suggested action appears on its own |
-| `approve` | Answers the paused investigation; the agent backs off checks and confirms |
-| `Is anything wrong?` | Open alerts and recent alert history |
-| `Write a postmortem for the latest incident` | A blameless postmortem built from the recorded timeline |
+Open https://cf-ai-oncall.sharvary-salgaonkar27.workers.dev (each browser gets its own private session). About 10 minutes end to end:
 
-Each browser gets its own private agent (up to 5 monitored endpoints per session).
+1. **Deep check:** click `Inspect https://api.github.com/users/octocat`. The reply covers DNS (via 1.1.1.1), status, and GitHub's real rate-limit headers (limit, remaining, reset).
+2. **Start monitoring:** click `Monitor https://example.com every 60 seconds`. The first check runs immediately; after that a Durable Object alarm checks it every minute on its own.
+3. **Add a failing endpoint:** type `Monitor https://httpbin.org/status/503 every 60 seconds`.
+4. **Wait about 3 minutes without typing.** After 2 failed checks a `down` alert opens and a Workflow investigates: it waits 30s, rechecks, compares with history, and Llama 3.3 writes a diagnosis. The incident appears in chat on its own, with a **suggested action**.
+5. **Approve it:** type `approve`. The paused Workflow resumes, slows the checks to every 5 minutes, and confirms in chat.
+6. **Ask about it:** click `Is anything wrong?` for open alerts, or `Write a postmortem for the latest incident` for a postmortem built from the recorded timeline.
+7. **Clean up:** `Stop monitoring httpbin`.
+
+Other things to try: `Inspect https://www.linkedin.com/in/anyone` (detected as bot blocking, not "down"), `Inspect https://this-domain-does-not-exist-12345.com` (NXDOMAIN).
 
 ## How it maps to the assignment
 
